@@ -19,7 +19,7 @@ func main() {
 
 	err := read.Read(fileDir)
 	if err != nil {
-		log.Printf("Failed to read the file %w", err)
+		log.Printf("Failed to read the file %s", err.Error())
 	}
 
 	elapsed := time.Since(start)
