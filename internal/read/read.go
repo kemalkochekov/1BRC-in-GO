@@ -109,9 +109,9 @@ func Read(fileDir string) error {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	newTasks := make(chan []byte, 2)
+	newTasks := make(chan []byte, 10)
 	ResultCity := make(map[string]*weather)
-	for w := 0; w < 2; w++ {
+	for w := 0; w < 10; w++ {
 		wg.Add(1)
 		go Worker(newTasks, ResultCity, &wg, &mu)
 	}
