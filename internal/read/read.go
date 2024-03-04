@@ -10,7 +10,6 @@ import (
 	"os"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 )
@@ -28,18 +27,23 @@ type outputWeather struct {
 	average    float64
 }
 
-func maxInt(a, b int64) int64 {
-	if a > b {
-		return a
+func convertStringToInt64(input string) int64 {
+	isNegative := false
+	if input[0] == '-' {
+		isNegative = true
+		input = input[1:]
+	}
+	var num int64
+	if len(input) == 3 {
+		num = int64(input[0])*10 + int64(input[2]) - int64('0')*11
+	} else {
+		num = int64(input[0])*100 + int64(input[1])*10 + int64(input[3]) - (int64('0') * 111)
+	}
+	if isNegative {
+		return -num
 	}
 
-	return b
-}
-
-func convertStringToInt64(input string) (int64, error) {
-	input = input[:len(input)-2] + input[len(input)-1:]
-	output, err := strconv.ParseInt(input, 10, 64)
-	return output, err
+	return num
 }
 func roundFloat(x float64) float64 {
 	rounded := math.Round(x * 10)
@@ -49,26 +53,11 @@ func roundFloat(x float64) float64 {
 	return rounded / 10
 }
 
-func minInt(a, b int64) int64 {
-	if a > b {
-		return b
-	}
-
-	return a
-}
-
 // Choose an appropriate number of shards.
 const (
-	batchSize        = 1000
-	bufferedChannels = 100
+	bufferedChannels = 15
 	chunkSize        = 64 * 1024 * 1024
 )
-
-func Worker(newTasks <-chan []byte, mapStream chan<- map[string]weather) {
-	for data := range newTasks {
-		processData(data, mapStream)
-	}
-}
 
 func processData(data []byte, mapStream chan<- map[string]weather) {
 	lines := strings.Split(string(data), "\n")
@@ -84,15 +73,15 @@ func processData(data []byte, mapStream chan<- map[string]weather) {
 			continue
 		}
 
-		num, err := convertStringToInt64(parts[1])
-		if err != nil {
-			log.Printf("Error converting string to int64: %v", err)
-			continue
-		}
+		num := convertStringToInt64(parts[1])
 
 		if val, ok := mapSend[parts[0]]; ok {
-			val.maxWeather = maxInt(val.maxWeather, num)
-			val.minWeather = minInt(val.minWeather, num)
+			if val.maxWeather < num {
+				val.maxWeather = num
+			}
+			if val.minWeather > num {
+				val.minWeather = num
+			}
 			val.sum += num
 			val.count++
 			mapSend[parts[0]] = val
@@ -129,10 +118,12 @@ func Read(fileDir string) error {
 	mapStream := make(chan map[string]weather, 10)
 	newTasks := make(chan []byte, bufferedChannels)
 
-	for w := 0; w < numWorkers; w++ {
+	for w := 0; w < numWorkers-1; w++ {
 		wg.Add(1)
 		go func() {
-			Worker(newTasks, mapStream)
+			for data := range newTasks {
+				processData(data, mapStream)
+			}
 			wg.Done()
 		}()
 	}
@@ -173,8 +164,12 @@ func Read(fileDir string) error {
 			if val, ok := merge[city]; ok {
 				val.sum += info.sum
 				val.count += info.count
-				val.maxWeather = maxInt(val.maxWeather, info.maxWeather)
-				val.minWeather = minInt(val.minWeather, info.minWeather)
+				if val.maxWeather < info.maxWeather {
+					val.maxWeather = info.maxWeather
+				}
+				if val.minWeather > info.minWeather {
+					val.minWeather = info.minWeather
+				}
 				merge[city] = val
 			} else {
 				merge[city] = info
@@ -182,34 +177,21 @@ func Read(fileDir string) error {
 		}
 	}
 
-	return WriteOutput(fileDir, merge)
+	return WriteOutput(merge, fileDir)
 }
-func WriteOutput(fileDir string, data map[string]weather) error {
-	output, err := os.OpenFile(fileDir+"/output.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("Failed to Create file or write file %w", err)
-	}
-
-	defer func() {
-		err = output.Close()
-		if err != nil {
-			log.Printf("Failed to close %s", err.Error())
-		}
-	}()
+func WriteOutput(data map[string]weather, fileDir string) error {
 
 	allWeather := make([]outputWeather, len(data))
 	idx := 0
 
 	for key, value := range data {
-		average := roundFloat(float64(value.sum) / 10.0 / float64(value.count))
-
 		allWeather[idx] = outputWeather{
 			maxWeather: roundFloat(float64(value.maxWeather) / 10.0),
 			minWeather: roundFloat(float64(value.minWeather) / 10.0),
-			average:    average,
+			average:    roundFloat(float64(value.sum) / 10.0 / float64(value.count)),
 			name:       key,
 		}
-
+		fmt.Println(allWeather[idx].maxWeather)
 		idx++
 	}
 
@@ -217,28 +199,21 @@ func WriteOutput(fileDir string, data map[string]weather) error {
 		return allWeather[i].name < allWeather[j].name
 	})
 
-	var outputLines []string
+	var resultStringBuilder strings.Builder
 	for _, item := range allWeather {
-		line := fmt.Sprintf("%s=%.1f/%.1f/%.1f\n", item.name, item.maxWeather, item.minWeather, item.average)
-		outputLines = append(outputLines, line)
-		if len(outputLines) >= batchSize {
-			writeBatchToFile(output, outputLines)
-			outputLines = outputLines[:0]
-		}
+		resultStringBuilder.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f, ", item.name, item.minWeather, item.average, item.maxWeather))
 	}
-	fmt.Println("Data has been written")
-	if len(outputLines) > 0 {
-		writeBatchToFile(output, outputLines)
+
+	file, err := os.Create(fileDir + "/output.txt")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = file.WriteString(resultStringBuilder.String())
+	if err != nil {
+		return err
 	}
 
 	return nil
-}
-
-func writeBatchToFile(file *os.File, lines []string) {
-	for _, line := range lines {
-		_, err := file.WriteString(line)
-		if err != nil {
-			log.Fatalf("Failed to write batch to file: %v", err)
-		}
-	}
 }
