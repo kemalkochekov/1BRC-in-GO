@@ -2,15 +2,12 @@ package main
 
 import (
 	"1BRC_in_Go/internal/read"
-	"flag"
 	"fmt"
 	"github.com/joho/godotenv"
 	"log"
 	"os"
 	"time"
 )
-
-var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 
 func main() {
 	start := time.Now()
