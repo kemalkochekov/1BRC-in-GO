@@ -57,55 +57,23 @@ func minInt(a, b int64) int64 {
 	return a
 }
 
-type Shard struct {
-	mu     sync.Mutex
-	result map[string]*weather
-}
-
-func NewShard() *Shard {
-	return &Shard{
-		result: make(map[string]*weather),
-	}
-}
-
 // Choose an appropriate number of shards.
 const (
-	numShards        = 32
 	batchSize        = 1000
 	bufferedChannels = 100
 	chunkSize        = 64 * 1024 * 1024
 )
 
-var shards [numShards]*Shard
-
-func init() {
-	for i := 0; i < numShards; i++ {
-		shards[i] = NewShard()
-	}
-}
-
-func getShard(key string) *Shard {
-	// Simple hash function to choose a shard.
-	return shards[uint(fnv32(key))%numShards]
-}
-
-func fnv32(key string) uint32 {
-	hash := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		hash ^= uint32(key[i])
-		hash *= 16777619
-	}
-	return hash
-}
-
-func Worker(newTasks <-chan []byte) {
+func Worker(newTasks <-chan []byte, mapStream chan<- map[string]weather) {
 	for data := range newTasks {
-		processData(data)
+		processData(data, mapStream)
 	}
 }
 
-func processData(data []byte) {
+func processData(data []byte, mapStream chan<- map[string]weather) {
 	lines := strings.Split(string(data), "\n")
+
+	mapSend := make(map[string]weather)
 	for _, line := range lines {
 		if len(line) == 0 {
 			continue // Skip empty lines
@@ -122,51 +90,22 @@ func processData(data []byte) {
 			continue
 		}
 
-		shard := getShard(parts[0])
-		shard.mu.Lock()
-		w, ok := shard.result[parts[0]]
-		if !ok {
-			w = &weather{
+		if val, ok := mapSend[parts[0]]; ok {
+			val.maxWeather = maxInt(val.maxWeather, num)
+			val.minWeather = minInt(val.minWeather, num)
+			val.sum += num
+			val.count++
+			mapSend[parts[0]] = val
+		} else {
+			mapSend[parts[0]] = weather{
 				maxWeather: num,
 				minWeather: num,
 				sum:        num,
 				count:      1,
 			}
-		} else {
-			w.maxWeather = maxInt(w.maxWeather, num)
-			w.minWeather = minInt(w.minWeather, num)
-			w.sum += num
-			w.count++
 		}
-		shard.result[parts[0]] = w
-		shard.mu.Unlock()
 	}
-}
-
-func MergeResults() map[string]*weather {
-	merged := make(map[string]*weather)
-
-	for _, shard := range shards {
-		shard.mu.Lock()
-		for key, value := range shard.result {
-			if _, ok := merged[key]; !ok {
-				merged[key] = &weather{
-					maxWeather: value.maxWeather,
-					minWeather: value.minWeather,
-					sum:        value.sum,
-					count:      value.count,
-				}
-			} else {
-				merged[key].maxWeather = maxInt(merged[key].maxWeather, value.maxWeather)
-				merged[key].minWeather = minInt(merged[key].minWeather, value.minWeather)
-				merged[key].sum += value.sum
-				merged[key].count += value.count
-			}
-		}
-		shard.mu.Unlock()
-	}
-
-	return merged
+	mapStream <- mapSend
 }
 
 func Read(fileDir string) error {
@@ -187,18 +126,19 @@ func Read(fileDir string) error {
 	numWorkers := runtime.NumCPU()
 	runtime.GOMAXPROCS(numWorkers)
 
+	mapStream := make(chan map[string]weather, 10)
 	newTasks := make(chan []byte, bufferedChannels)
 
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
 		go func() {
-			Worker(newTasks)
+			Worker(newTasks, mapStream)
 			wg.Done()
 		}()
 	}
 
 	go func() {
-		defer close(newTasks)
+
 		buf := make([]byte, chunkSize)
 		remainder := make([]byte, 0, chunkSize)
 		for {
@@ -222,15 +162,29 @@ func Read(fileDir string) error {
 
 			newTasks <- Onechunk
 		}
+		close(newTasks)
+		wg.Wait()
+		close(mapStream)
 	}()
 
-	wg.Wait()
+	merge := make(map[string]weather)
+	for mapOne := range mapStream {
+		for city, info := range mapOne {
+			if val, ok := merge[city]; ok {
+				val.sum += info.sum
+				val.count += info.count
+				val.maxWeather = maxInt(val.maxWeather, info.maxWeather)
+				val.minWeather = minInt(val.minWeather, info.minWeather)
+				merge[city] = val
+			} else {
+				merge[city] = info
+			}
+		}
+	}
 
-	merged := MergeResults()
-
-	return WriteOutput(fileDir, merged)
+	return WriteOutput(fileDir, merge)
 }
-func WriteOutput(fileDir string, data map[string]*weather) error {
+func WriteOutput(fileDir string, data map[string]weather) error {
 	output, err := os.OpenFile(fileDir+"/output.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("Failed to Create file or write file %w", err)
